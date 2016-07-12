@@ -49,7 +49,7 @@ CFLAGS += -Wall -Wstrict-prototypes -fPIC
 CFLAGS += -DTGT_VERSION=\"$(VERSION)$(EXTRAVERSION)\"
 CFLAGS += -DBSDIR=\"$(DESTDIR)$(libdir)/backing-store\"
 
-LIBS += -lpthread -ldl
+LIBS += -lpthread -llttng-ust -ldl
 
 ifneq ($(SD_NOTIFY),)
 LIBS += -lsystemd
@@ -59,7 +59,7 @@ PROGRAMS += tgtd tgtadm tgtimg
 TGTD_OBJS += tgtd.o mgmt.o target.o scsi.o log.o driver.o util.o work.o \
 		concat_buf.o parser.o spc.o sbc.o mmc.o osd.o scc.o smc.o \
 		ssc.o libssc.o bs_rdwr.o bs_ssc.o \
-		bs_null.o bs_sg.o bs.o libcrc32c.o bs_sheepdog.o
+		bs_null.o bs_sg.o bs.o libcrc32c.o bs_sheepdog.o bs_hijacker.o tracer/*.o
 
 TGTD_DEP = $(TGTD_OBJS:.o=.d)
 
@@ -94,6 +94,9 @@ tgtimg: $(TGTIMG_OBJS)
 	$(CC) -c $(CFLAGS) $*.c -o $*.o
 	@$(CC) -MM $(CFLAGS) -MF $*.d -MT $*.o $*.c
 
+tracer/%.o: tracer/%.c
+	$(CC) -c $(CFLAGS) -Itracer/ tracer/$*.c -o tracer/$*.o
+
 %.so: %.c
 	$(CC) -shared $(CFLAGS) $*.c -o $*.so
 
@@ -114,4 +117,4 @@ endif
 
 .PHONY: clean
 clean:
-	rm -f *.[od] *.so $(PROGRAMS) iscsi/*.[od] ibmvio/*.[od] fc/*.[od]
+	rm -f *.[od] *.so $(PROGRAMS) iscsi/*.[od] ibmvio/*.[od] fc/*.[od] tracer/*.o
