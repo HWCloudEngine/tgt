@@ -1,18 +1,17 @@
 #include "bs_hijacker.h"
-
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <string.h>
+#include <netinet/tcp.h> 
+#include <sys/socket.h> 
+#include <sys/un.h>
+#include <sys/eventfd.h>
+#include <string.h> 
 #include <stdbool.h>
 #include <assert.h>
-
 #include "tgtd.h"
 #include "scsi.h"
 #include "util.h"
@@ -21,210 +20,406 @@
 
 #define HIJACKER_MAGIC (0xAA)
 
+//#define USE_UNIX_DOMAIN
+//#define UNIX_SOCKET_NAME "/opt/channel" 
+
 hijacker_volume_mgr_t g_volume_mgr;
 
-static void bs_volume_mgr_init(hijacker_volume_mgr_t* vol_mgr) {
-    INIT_LIST_HEAD(&vol_mgr->volumes_list);
-    pthread_mutex_init(&vol_mgr->mgr_lock, NULL);
+/*socket*/
+static int bs_socket_set_nonblock(int fd)
+{
+    int flags;
+    flags = fcntl(fd, F_GETFL, 0);
+    if(flags < 0)
+        return flags;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static inline hijacker_volume_t* bs_volume(struct scsi_lu* lu){
+static int bs_socket_set_block(int fd)
+{
+    int flags;
+    flags = fcntl(fd, F_GETFL, 0);
+    if(flags < 0)
+        return flags;
+
+    return fcntl(fd, F_SETFL, flags | ~O_NONBLOCK);
+}
+
+static int bs_socket_set_nodelay(int fd)
+{
+    int disable = 1;
+    int ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
+                         &disable, sizeof(disable));
+    return ret;
+}
+
+static int bs_socket_set_sndbuf(int fd, int size)
+{
+    socklen_t len;
+    len = sizeof(size);
+    return setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, len);
+} 
+
+static int bs_socket_set_rcvbuf(int fd, int size)
+{
+    socklen_t len;
+    len = sizeof(size);
+    return setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, len);
+} 
+
+static int bs_socket_init(hijacker_volume_t* volume, char* host, short port)
+{
+    int ret = 0;
+    volume->jwriter_host = strdup(host);
+    volume->jwriter_port = port;
+
+#ifndef USE_UNIX_DOMAIN
+    volume->jwriter_sock = socket(AF_INET, SOCK_STREAM, 0);
+#else
+    volume->jwriter_sock = socket(AF_UNIX, SOCK_STREAM, 0);
+#endif
+    if(-1 == volume->jwriter_sock){
+        eprintf("failed to create socket err=%d \n", errno);
+        ret = -1;
+        goto err;
+    }
+
+#ifndef USE_UNIX_DOMAIN
+    struct sockaddr_in jwriter_addr;
+    memset(&jwriter_addr, 0, sizeof(jwriter_addr));
+    jwriter_addr.sin_family = AF_INET;
+    jwriter_addr.sin_port = htons(port);
+    ret = inet_pton(AF_INET, host, &jwriter_addr.sin_addr);
+    if(ret <= 0){
+        eprintf("failed to inet_pton, host:%s port:%d errno:%d error:%s \n",
+                host, port, errno,strerror(ret));
+        goto err;
+    }
+    ret = connect(volume->jwriter_sock, &jwriter_addr, sizeof(jwriter_addr));
+    if(ret < 0){
+        eprintf("failed to connect,host:%s port:%d errno:%d error:%s \n",
+                host, port, errno, strerror(ret));
+        goto err;
+    }
+#else
+    struct sockaddr_un addr;
+    memset(&addr,0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, UNIX_SOCKET_NAME, sizeof(UNIX_SOCKET_NAME)-1);
+    ret = connect(volume->jwriter_sock, &addr, sizeof(addr));
+    if(ret < 0){
+        eprintf("connect unix domain name:%s \n", UNIX_SOCKET_NAME);
+        goto err;
+    }
+#endif
+
+    ret = bs_socket_set_nonblock(volume->jwriter_sock);
+    if(ret < 0){
+        eprintf("failed to socket set nonblock, errno:%d \n", errno);
+        goto err;
+    }
+   
+#ifndef USE_UNIX_DOMAIN
+    ret = bs_socket_set_nodelay(volume->jwriter_sock);
+    if(ret < 0){
+        eprintf("failed to socket set nodelay, errno:%d \n", errno);
+        goto err;
+    }
+
+    const int buf_size = 8*1024*1024U;
+    ret = bs_socket_set_sndbuf(volume->jwriter_sock, buf_size);
+    if(ret < 0){
+        eprintf("failed to socket set sndbuf, errno:%d \n", errno);
+        goto err;
+    }
+
+    ret = bs_socket_set_rcvbuf(volume->jwriter_sock, buf_size);
+    if(ret < 0){
+        eprintf("failed to socket set rcvbuf, errno:%d \n", errno);
+        goto err;
+    }
+#endif
+
+    eprintf("socket init ok \n");
+    return ret;
+err:
+    eprintf("socket init failed \n");
+    return ret;
+}
+
+static void bs_socket_fini(hijacker_volume_t* volume)
+{
+    if(volume && -1 != volume->jwriter_sock){
+        close(volume->jwriter_sock);
+    }
+}
+
+static int bs_socket_send(hijacker_volume_t* volume, char* buf, ssize_t buf_len)
+{
+    ssize_t nwrite = 0;
+    char*   pbuf   = buf;
+    ssize_t nleft  = buf_len;
+   
+#if 1
+    while(nleft > 0){
+        nwrite = write(volume->jwriter_sock, pbuf , nleft); 
+        if(nwrite < nleft){
+            if(nwrite == -1 && errno != EAGAIN){
+                perror("socket write error");
+            }
+            break;
+        } 
+        eprintf("socket write nwrite:%ld nleft:%ld \n", nwrite, nleft);
+        nleft -= nwrite;
+        pbuf  += nwrite;
+    }
+#else
+    while (0 != nleft) {
+        nwrite = write(volume->jwriter_sock, pbuf, nleft);
+        if (0 == nwrite) {
+            eprintf("failed to socket write err:%d nwrite:%ld \n", 
+                    errno, nwrite);
+            return nwrite;
+        }
+
+        if (-1 == nwrite) {
+            if(errno == EAGAIN || errno == EINTR){
+                eprintf("socket write busy wait err:%d \n", errno);
+                continue;
+            }
+            eprintf("failed to socket write err:%d nwrite:%ld \n", 
+                    errno, nwrite);
+            return nwrite;
+        }
+        pbuf  += nwrite;
+        nleft -= nwrite;
+    }
+#endif
+
+    return buf_len;
+}
+
+static int bs_socket_recv(hijacker_volume_t* volume, char* buf, int buf_len)
+{
+    char*    pbuf  = buf;
+    uint32_t nleft = buf_len;
+    ssize_t  nread = 0;
+
+#if 1
+    while((nread = read(volume->jwriter_sock, pbuf, nleft)) > 0){
+        pbuf  += nread;
+        nleft -= nread;
+        eprintf("socket read nread:%ld nleft:%d \n", nread, nleft);
+    }
+    
+    if(nread == -1 && errno != EAGAIN){
+        perror("socket read error");
+    }
+#else
+    while(0 != nleft){
+        nread = read(volume->jwriter_sock, pbuf, nleft);
+        if(0 == nread){
+            eprintf("failed socket read data err=%d \n", errno);
+            return -1;
+        }
+
+        if(-1 == nread){
+            if(errno == EAGAIN || errno == EINTR){
+                eprintf("failed socket read busy err:%d \n", errno);
+            }
+            eprintf("failed socket read reply data err:%d \n", errno);
+            return -1;
+        }
+
+        nleft -= nread;
+        pbuf  += nread;
+    }
+#endif
+
+    return buf_len;
+}
+
+/*eventfd*/
+int _eventfd_read(int eventfd)
+{
+    uint64_t u;
+    int ret = read(eventfd, &u, sizeof(uint64_t));
+    if(ret != sizeof(uint64_t)){
+        eprintf("eventfd read failed ret=%d errno;%d \n", ret, errno);
+        return -1;
+    }
+    return 0;
+}
+
+int _eventfd_write(int eventfd)
+{
+    /*here should not be 0, otherwise will not be trigfer*/
+    uint64_t u = 1;
+    int ret = write(eventfd, &u, sizeof(uint64_t));
+    if(ret != sizeof(uint64_t)){
+        eprintf("eventfd read failed ret=%d errno;%d \n", ret, errno);
+        return -1;
+    }
+    return 0;
+}
+
+/*basic*/
+static inline hijacker_volume_t* bs_volume(struct scsi_lu* lu)
+{
     return (hijacker_volume_t*)((char*)lu + sizeof(*lu));
 }
 
-static hijacker_request_t* bs_request_construct(struct scsi_cmd* cmd) {
-    hijacker_request_t* io_request = NULL;
+static hijacker_request_t* bs_request_create(struct scsi_cmd* cmd)
+{
+    int io_req_len = sizeof(hijacker_request_t);
+    hijacker_request_t* io_req = (hijacker_request_t*)malloc(io_req_len);
+    assert(NULL != io_req);
+    memset(io_req, 0, io_req_len);
+    io_req->magic = HIJACKER_MAGIC;
+    io_req->handle = (uint64_t)cmd;
     switch (cmd->scb[0]) {
         case SYNCHRONIZE_CACHE:
         case SYNCHRONIZE_CACHE_16:
-            {
-                io_request = (hijacker_request_t*) malloc(sizeof(hijacker_request_t));
-                assert(NULL != io_request);
-                io_request->magic = HIJACKER_MAGIC;
-                io_request->type = SYNC_CACHE;
-                io_request->reserves = 0;
-                io_request->handle = (uint64_t) cmd;
-                io_request->offset = cmd->offset;
-                io_request->len = scsi_get_in_length(cmd);
-                break;
-            }
+            io_req->type = SYNC_CACHE;
+            eprintf(" bs_request_create syc cahche\n");
+            break;
         case WRITE_6:
         case WRITE_10:
         case WRITE_12:
         case WRITE_16:
-            {
-                int req_len = sizeof(hijacker_request_t) + scsi_get_out_length(cmd);
-                io_request = (hijacker_request_t*) malloc(req_len);
-                assert(NULL != io_request);
-                io_request->magic = HIJACKER_MAGIC;
-                io_request->type = SCSI_WRITE;
-                io_request->reserves = 0;
-                io_request->handle = (uint64_t) cmd;
-                io_request->offset = cmd->offset;
-                io_request->len = scsi_get_out_length(cmd);
-                /*fixme: to be optimized, here should avoid memory copy*/
-                memcpy(io_request->data, scsi_get_out_buffer(cmd),
-                       scsi_get_out_length(cmd));
-                break;
-            }
+            io_req->type  = SCSI_WRITE;
+            io_req->offset = cmd->offset;
+            io_req->len = scsi_get_out_length(cmd);
+            eprintf(" bs_request_create write \n");
+            break;
         case READ_6:
         case READ_10:
         case READ_12:
         case READ_16:
-            io_request = (hijacker_request_t*) malloc(sizeof(hijacker_request_t));
-            assert(NULL != io_request);
-            io_request->magic = HIJACKER_MAGIC;
-            io_request->type = SCSI_READ;
-            io_request->reserves = 0;
-            io_request->handle = (uint64_t) cmd;
-            io_request->offset = cmd->offset;
-            io_request->len = scsi_get_in_length(cmd);
+            io_req->type = SCSI_READ;
+            io_req->offset = cmd->offset;
+            io_req->len = scsi_get_in_length(cmd);
+            eprintf(" bs_request_create read \n");
             break;
         default:
             eprintf("cmd->scb[0]:%x \n", cmd->scb[0]);
             break;
     }
 
-    return io_request;
+    return io_req;
 }
 
-static void bs_request_deconstruct(hijacker_request_t* req) {
+static void bs_request_destroy(hijacker_request_t* req)
+{
     if (req) {
         free(req);
     }
 }
 
-static int bs_socket_send(hijacker_volume_t* volume, hijacker_request_t* request) {
-    ssize_t nwrite = 0;
-    char* p_buf = (char*) request;
-    ssize_t p_buf_len = sizeof(*request) + request->len;
-    ssize_t nleft = p_buf_len;
 
-    while (0 != nleft) {
-        nwrite = write(volume->jwriter_sock, p_buf, nleft);
-        if (0 == nwrite) {
-            eprintf("failed to socket writer err:%d \n", errno);
-            return nwrite;
-        }
-        if (-1 == nwrite) {
-            eprintf("failed to socket write err:%d \n", errno);
-            return -1;
-        }
-        p_buf += nwrite;
-        nleft += nwrite;
+/*callback*/
+void socket_write_callback(int fd, int events, void* data);
+void socket_read_callback(int fd, int events, void* data);
+void socket_callback(int fd, int events, void*data);
+
+void eventfd_callback(int fd, int events, void* data)
+{
+    hijacker_volume_t* volume = (hijacker_volume_t*)data;
+  
+    _eventfd_read(fd);
+    
+    list_splice_init(&volume->pending_list, &volume->sending_list);
+
+    tgt_event_del(volume->pending_eventfd);
+
+    int ret = tgt_event_add(volume->jwriter_sock, EPOLLOUT | EPOLLET,
+                            socket_callback, volume);
+    if(ret){
+        eprintf("failed to tgt event add, errno:%d \n", errno);
     }
 
-    return p_buf_len;
 }
 
-static int bs_socket_recv(hijacker_volume_t* volume, hijacker_reply_t** reply)
+void socket_write_callback(int fd, int events, void* data)
 {
-    hijacker_reply_t reply_head = {0};
-
-    int ret = read(volume->jwriter_sock, &reply_head, sizeof(reply_head));
-    if(ret != sizeof(reply_head)){
-        eprintf("failed socket read reply head ret=%d want=%ld \n", ret, sizeof(reply_head));
-        return -1;
-    }
-
-    hijacker_reply_t* out_reply = (hijacker_reply_t*)malloc(sizeof(hijacker_reply_t) + reply_head.len);
-    memset(out_reply, 0, sizeof(hijacker_reply_t));
-    memcpy(out_reply, &reply_head, sizeof(reply_head));
-
-    char* p_buf = (char*)out_reply->data;
-    uint32_t p_buf_len = reply_head.len;
-    uint32_t nleft = p_buf_len;
-    uint32_t nread = 0;
-
-    while(0 != nleft)
-    {
-        nread = read(volume->jwriter_sock, p_buf, nleft);
-        if(0 == nread)
-        {
-            eprintf("failed socket read reply data err=%d \n", errno);
-            return -1;
-        }
-
-        if(-1 == nread)
-        {
-            eprintf("failed socket read reply data err=%d \n", errno);
-            return -1;
-        }
-
-        nleft -= nread;
-        p_buf += nread;
-    }
-
-    *reply = out_reply;
-    return 0;
-}
-
-static void* bs_net_send_thr(void* arg)
-{
-    hijacker_volume_t* volume = (hijacker_volume_t*)arg;
+    hijacker_volume_t* volume = (hijacker_volume_t*)data;
     struct scsi_cmd* cur_cmd = NULL;
     struct scsi_cmd* next_cmd = NULL;
-    struct list_head sending_que;
 
-    INIT_LIST_HEAD(&sending_que);
-
-    while(true){
-        pthread_mutex_lock(&volume->pending_lock);
-        while(list_empty(&volume->pending_list)){
-            eprintf("pending list empty \n");
-            pthread_cond_wait(&volume->pending_cond, &volume->pending_lock);
-        }
-        eprintf("pending list not empty \n");
-        list_splice_init(&volume->pending_list, &sending_que);
-        pthread_mutex_unlock(&volume->pending_lock);
-
-        int send_req_num = 0;
-        int send_req_size = 0;
-
-        list_for_each_entry_safe(cur_cmd, next_cmd, &sending_que, bs_list)
-        {
-            hijacker_request_t* request = bs_request_construct(cur_cmd);
-            if(request){
-                eprintf("send thr request magic:%d type:%d handle:%ld len:%d \n",
-                        request->magic, request->type, request->handle, request->len);
-
-                send_req_size += bs_socket_send(volume, request);
-                send_req_num++; 
-
-                bs_request_deconstruct(request);
-
-                list_del(&cur_cmd->bs_list);
-            }
-        }
-
-        tracepoint(hijacker_provider, net_send_tracepoint, send_req_num, send_req_size);
+    if(list_empty(&volume->sending_list)){
+        eprintf("socket_write_callback send queue empty \n");
+        return;
     }
 
-    pthread_exit(NULL);
+    list_for_each_entry_safe(cur_cmd, next_cmd, &volume->sending_list, bs_list){
+        hijacker_request_t* request = bs_request_create(cur_cmd);
+        if(request){
+            eprintf("send thr request magic:%d type:%d handle:%ld off=%d len:%d\n",
+                    request->magic,request->type, 
+                    request->handle, request->offset, request->len);
+
+            /*send request head*/
+            bs_socket_send(volume, (char*)request, sizeof(hijacker_request_t));
+            
+            /*send request body*/
+            if(request->type == SCSI_WRITE){
+                bs_socket_send(volume, scsi_get_out_buffer(cur_cmd), 
+                               scsi_get_out_length(cur_cmd));
+            }
+
+            bs_request_destroy(request);
+
+            list_del(&cur_cmd->bs_list);
+        }
+    }
+
+    if(list_empty(&volume->sending_list)){
+        int ret = tgt_event_modify(volume->jwriter_sock, EPOLLIN | EPOLLET);
+        if(ret < 0){
+            eprintf("socket_write_callback modify epolin failed \n");
+            return;
+        }
+    }
 }
 
-static void* bs_net_recv_thr(void* arg)
+
+void socket_read_callback(int fd, int events, void* data)
 {
-    hijacker_volume_t* volume = (hijacker_volume_t*)arg;
+    int ret = 0;
+    hijacker_volume_t* volume = (hijacker_volume_t*)data;
 
     while(true){
-        hijacker_reply_t* reply = NULL;
-        int ret = bs_socket_recv(volume, &reply);
-        if(ret == -1 || reply == NULL){
-            eprintf("failed socket recv reply \n");
-            continue;
+        hijacker_reply_t reply_head = {0};
+        ret = bs_socket_recv(volume, (char*)&reply_head, sizeof(reply_head));
+        if(ret != sizeof(reply_head)){
+            eprintf("bs_socket_recv read failed ret:%d want:%ld \n",
+                    ret, sizeof(reply_head));
+            break;
+        }
+
+        size_t reply_len = sizeof(hijacker_reply_t) + reply_head.len;
+        hijacker_reply_t* reply = (hijacker_reply_t*)malloc(reply_len);
+        memset(reply, 0, sizeof(hijacker_reply_t));
+        memcpy(reply, &reply_head, sizeof(reply_head));
+        
+        if(reply->len > 0){
+            ret = bs_socket_recv(volume, (char*)reply->data, reply->len);
+            if(ret != reply->len){
+                eprintf("bs_socket_recv read failed ret:%d want:%d \n",
+                    ret, reply->len);
+                break;
+            }
         }
 
         eprintf("recv thr reply magic:%d err:%d handle:%ld len:%d \n",
                 reply->magic, reply->error, reply->handle, reply->len);
+
         if(reply->magic != HIJACKER_MAGIC){
-            eprintf("failed socket redv reply format error \n");
-            continue;
+            eprintf("failed socket read reply format error \n");
+            break;
         }
 
         struct scsi_cmd* cmd = (struct scsi_cmd*)reply->handle;
-        eprintf("scsi cdb[0]=%d \n", cmd->scb[0]);
-
         switch(cmd->scb[0])
         {
             case READ_6:
@@ -241,155 +436,31 @@ static void* bs_net_recv_thr(void* arg)
                 break;
         }
 
-        pthread_mutex_lock(&volume->scsi_ack_lock);
-        list_add_tail(&cmd->bs_list, &volume->scsi_ack_list);
-        pthread_mutex_unlock(&volume->scsi_ack_lock);
+        target_cmd_io_done(cmd, cmd->result);
 
-        pthread_cond_signal(&volume->scsi_ack_cond);
-    }
-
-    pthread_exit(NULL);
-}
-
-static void* bs_scsi_ack_thr(void* arg)
-{
-    hijacker_volume_t* volume = (hijacker_volume_t*)arg;
-    struct scsi_cmd* cur_cmd = NULL;
-    struct scsi_cmd* next_cmd = NULL;
-    struct list_head acking_que;
-    INIT_LIST_HEAD(&acking_que);
-
-    while(true){
-        pthread_mutex_lock(&volume->scsi_ack_lock);
-        while(list_empty(&volume->scsi_ack_list)){
-            eprintf("scsi ack list empty \n");
-            pthread_cond_wait(&volume->scsi_ack_cond, &volume->scsi_ack_lock);
-        }
-
-        list_splice_init(&volume->scsi_ack_list, &acking_que);
-        pthread_mutex_unlock(&volume->scsi_ack_lock);
-
-        list_for_each_entry_safe(cur_cmd, next_cmd, &acking_que, bs_list){
-            list_del(&cur_cmd->bs_list);
-            eprintf("scsi cdb[0]=%d result=%d \n", cur_cmd->scb[0], cur_cmd->result);
-            target_cmd_io_done(cur_cmd, cur_cmd->result);
+        if(reply){
+            free(reply);
         }
     }
 
-    pthread_exit(NULL);
+    tgt_event_del(volume->jwriter_sock);
+    ret = tgt_event_add(volume->pending_eventfd, EPOLLIN | EPOLLET,
+                        eventfd_callback, volume);
+    if(ret){
+        eprintf("failed to add pending read event, errno:%d \n", errno);
+    }
 }
 
-static void* bs_heart_beat_thr(void* arg)
+void socket_callback(int fd, int events, void*data)
 {
-    hijacker_volume_t* volume = (hijacker_volume_t*)arg;
+    if(events & EPOLLIN)
+        return socket_read_callback(fd, events, data);
 
-    while(true){
-        (void)volume;
-    }
-
-    pthread_exit(NULL);
+    if(events & EPOLLOUT)
+        return socket_write_callback(fd, events, data);
 }
 
-
-static void bs_volume_deinit(hijacker_volume_t* volume)
-{
-    pthread_cancel(volume->heart_beat_thr);
-    pthread_join(volume->heart_beat_thr, NULL);
-    eprintf("stopped the heart beat thread \n");
-
-    pthread_cancel(volume->scsi_ack_thr);
-    pthread_join(volume->scsi_ack_thr, NULL);
-    eprintf("stopped the scsi ack thread \n");
-
-    pthread_cancel(volume->recv_thr);
-    pthread_join(volume->recv_thr, NULL);
-    eprintf("stopped the recv thread \n");
-
-    pthread_cancel(volume->send_thr);
-    pthread_join(volume->send_thr, NULL);
-    eprintf("stopped the send thread \n");
-
-    if(-1 == volume->jwriter_sock){
-        close(volume->jwriter_sock);
-    }
-    pthread_cond_destroy(&volume->scsi_ack_cond);
-    pthread_mutex_destroy(&volume->scsi_ack_lock);
-
-    pthread_cond_destroy(&volume->pending_cond);
-    pthread_mutex_destroy(&volume->pending_lock);
-}
-
-static int bs_volume_init(hijacker_volume_t* volume, char* host, short port)
-{
-    int ret;
-    INIT_LIST_HEAD(&volume->volume_list);
-
-    pthread_cond_init(&volume->pending_cond, NULL);
-    pthread_mutex_init(&volume->pending_lock, NULL);
-    INIT_LIST_HEAD(&volume->pending_list);
-
-    pthread_cond_init(&volume->scsi_ack_cond, NULL);
-    pthread_mutex_init(&volume->scsi_ack_lock, NULL);
-    INIT_LIST_HEAD(&volume->scsi_ack_list);
-
-    volume->jwriter_host = strdup(host);
-    volume->jwriter_port = port;
-    volume->jwriter_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if(-1 == volume->jwriter_sock){
-        eprintf("failed to create socket err=%d \n", errno);
-        goto err;
-    }
-
-    struct sockaddr_in jwriter_addr;
-    memset(&jwriter_addr, 0, sizeof(jwriter_addr));
-    jwriter_addr.sin_family = AF_INET;
-    jwriter_addr.sin_port = htons(port);
-    ret = inet_pton(AF_INET, host, &jwriter_addr.sin_addr);
-    if(ret <= 0){
-        eprintf("failed to inet_pton, errno:%d error:%s \n", errno, strerror(ret));
-        goto err;
-    }
-    ret = connect(volume->jwriter_sock, &jwriter_addr, sizeof(jwriter_addr));
-    if(ret <= 0){
-        eprintf("failed to connect, host:%s errno:%d error:%s \n", host, errno, strerror(ret));
-        goto err;
-    }
-
-    int disable = 1;
-    ret = setsockopt(volume->jwriter_sock, IPPROTO_TCP, TCP_NODELAY, &disable, sizeof(disable));
-    if(ret < 0){
-        eprintf("failed to setsockopt,  errno:%d error:%s \n", errno, strerror(ret));
-        goto err;
-    }
-
-    ret = pthread_create(&volume->send_thr, NULL, bs_net_send_thr, volume);
-    if(ret){
-        eprintf("failed to create send thread., %s \n", strerror(ret));
-        goto err;
-    }
-    ret = pthread_create(&volume->recv_thr, NULL, bs_net_recv_thr, volume);
-    if(ret){
-        eprintf("failed to create recv thread., %s \n", strerror(ret));
-        goto err;
-    }
-    ret = pthread_create(&volume->scsi_ack_thr, NULL, bs_scsi_ack_thr, volume);
-    if(ret){
-        eprintf("failed to create scsi ack thread., %s \n", strerror(ret));
-        goto err;
-    }
-    ret = pthread_create(&volume->heart_beat_thr, NULL, bs_heart_beat_thr, volume);
-    if(ret){
-        eprintf("failed to create heart beat thread., %s \n", strerror(ret));
-        goto err;
-    }
-    eprintf("volume init ok \n");
-    return 0;
-err:
-    bs_volume_deinit(volume);
-    eprintf("volume init failed \n");
-    return -1;
-}
-
+/*string util*/
 static char* util_slurp_to_semi(char **p)
 {
     char *end = index(*p, ';');
@@ -430,6 +501,117 @@ static int util_is_opt(const char *opt, char *p)
     return ret;
 }
 
+/*business*/
+static void bs_volume_mgr_init(hijacker_volume_mgr_t* vol_mgr) 
+{
+    INIT_LIST_HEAD(&vol_mgr->volumes_list);
+    pthread_mutex_init(&vol_mgr->mgr_lock, NULL);
+}
+
+static void bs_volume_mgr_fini(hijacker_volume_mgr_t* vol_mgr)
+{
+    return;
+}
+
+/*todo: block notify server start/stop volume protected*/
+#if 0
+static int bs_volume_notify(hijacker_volume_t* volume, bool start)
+{
+    int req_len = sizeof(hijacker_request_t);
+    req_len += start ? sizeof(add_vol_req_t) : sizeof(del_vol_req_t);
+
+    hijacker_request_t* req = (hijacker_request_t*)malloc(req_len);
+    memset(req, 0, req_len);
+    req->magic = HIJACKER_MAGIC;
+    req->type  = start ? ADD_VOLUME : DEL_VOLUME;
+    req->reserves = 0;
+    req->handle = 0;
+    req->offset = 0;
+    req->len = start ? sizeof(add_vol_req_t) : sizeof(del_vol_req_t);
+   
+    if(start){
+        add_vol_req_t* add_vol = (add_vol_req_t*)req->data;
+        strcpy(add_vol->volume_name, volume->volume_name);
+        strcpy(add_vol->device_path, volume->device_path);
+    } else {
+        del_vol_req_t* add_vol = (del_vol_req_t*)req->data;
+        strcpy(add_vol->volume_name, volume->volume_name);
+    }
+
+    int ret = bs_socket_send(volume, req);
+    if(ret != req_len){
+        eprintf("notify start send err ret:%d size:%d \n", ret, req_len);
+        goto out;;
+    }
+
+    hijacker_reply_t* reply = NULL;
+    ret = bs_socket_recv(volume, &reply);
+    if(ret || NULL == reply){
+        eprintf("notify start recv err ret:%d \n", ret);
+        goto out;
+    }
+    
+    if(reply->error == 0){
+        eprintf("notify %s ok\n", (start ? "start" : "stop"));
+    } else {
+        eprintf("notify %s failed\n", (start ? "start" : "stop"));
+    }
+
+out:
+    if(reply){
+        free(reply);
+    }
+    if(req){
+        free(req);
+    }
+    return ret;;
+}
+#endif
+
+static void bs_volume_deinit(hijacker_volume_t* volume);
+
+static int bs_volume_init(hijacker_volume_t* volume, 
+                          char* volume_name, 
+                          char* device_path,
+                          char* host, 
+                          short port)
+{
+    int ret;
+    INIT_LIST_HEAD(&volume->volume_list);
+
+    strcpy(volume->volume_name, volume_name);
+    strcpy(volume->device_path, device_path);
+    
+    ret = bs_socket_init(volume, host, port);
+    if(ret){
+        eprintf("failed to socket init., %s \n", strerror(ret));
+        goto err;
+    }
+    
+    INIT_LIST_HEAD(&volume->pending_list);
+    volume->pending_eventfd = eventfd(0, EFD_NONBLOCK);
+    ret = tgt_event_add(volume->pending_eventfd, EPOLLIN | EPOLLET,
+                        eventfd_callback, volume);
+    if(ret < 0){
+        eprintf("failed to add pending read event, errno:%d \n", errno);
+        goto err;
+    }
+
+    INIT_LIST_HEAD(&volume->sending_list);
+    eprintf("volume init ok \n");
+    return 0;
+err:
+    bs_volume_deinit(volume);
+    eprintf("volume init failed \n");
+    return -1;
+}
+
+static void bs_volume_deinit(hijacker_volume_t* volume)
+{
+    bs_socket_fini(volume);
+    eprintf("volume deinit \n");
+    /*todo: other resouce free*/
+}
 
 static tgtadm_err bs_hijacker_init(struct scsi_lu* lu, char* bsopts)
 {
@@ -440,7 +622,9 @@ static tgtadm_err bs_hijacker_init(struct scsi_lu* lu, char* bsopts)
     }
 
     char* host = "127.0.0.1";
-    short port = 1111;
+    short port = 9999;
+    char* volume_name = "test_vol";
+    char* device_path = "/dev/sdx";
 
     while(bsopts && strlen(bsopts)){
         if(util_is_opt("host", bsopts)){
@@ -460,7 +644,7 @@ static tgtadm_err bs_hijacker_init(struct scsi_lu* lu, char* bsopts)
         return TGTADM_UNKNOWN_ERR;
     }
 
-    int ret = bs_volume_init(volume, host, port);
+    int ret = bs_volume_init(volume,volume_name,device_path, host, port); 
     if(ret < 0){
         eprintf("failed to bs_volume_init \n");
         return TGTADM_UNKNOWN_ERR;
@@ -473,20 +657,21 @@ static tgtadm_err bs_hijacker_init(struct scsi_lu* lu, char* bsopts)
 static void bs_hijacker_exit(struct scsi_lu* lu)
 {
     hijacker_volume_t* volume = bs_volume(lu);
-
     assert(NULL != volume);
-
     bs_volume_deinit(volume);
+    eprintf("hijacker exit ok \n");
 }
 
-static int bs_hijacker_open(struct scsi_lu* lu, char* path, int* fd, uint64_t* size)
+static int bs_hijacker_open(struct scsi_lu* lu, char* path, 
+                            int* fd, uint64_t* size)
 {
     uint32_t blksize = 0;
-    eprintf("open path=%s \n", path);
 
-    *fd = backed_file_open(path, O_RDWR | O_LARGEFILE | lu->bsoflags, size, &blksize);
+    *fd = backed_file_open(path, O_RDWR | O_LARGEFILE | lu->bsoflags, 
+                           size, &blksize);
     if(*fd == -1 && (errno == EACCES || errno == EROFS)){
-        *fd = backed_file_open(path, O_RDONLY | O_LARGEFILE | lu->bsoflags, size, &blksize);
+        *fd = backed_file_open(path, O_RDONLY | O_LARGEFILE | lu->bsoflags, 
+                               size, &blksize);
         lu->attrs.readonly = 1;
     }
 
@@ -501,6 +686,7 @@ static int bs_hijacker_open(struct scsi_lu* lu, char* path, int* fd, uint64_t* s
 
 static void bs_hijacker_close(struct scsi_lu* lu)
 {
+    eprintf("close ok \n");
     return ;
 }
 
@@ -510,21 +696,30 @@ static int bs_hijacker_cmd_submit(struct scsi_cmd* cmd)
     struct scsi_lu* lu = cmd->dev;
     hijacker_volume_t* volume = bs_volume(lu);
 
-    eprintf("cmd_submit cmd cdb[0]=%d \n", cmd->scb[0]);
-
-    pthread_mutex_lock(&volume->pending_lock);
+    switch (cmd->scb[0]) {
+        case SYNCHRONIZE_CACHE:
+        case SYNCHRONIZE_CACHE_16:
+        //case READ_6:
+        //case READ_10:
+        //case READ_12:
+        //case READ_16:
+            cmd->result = 0;
+            target_cmd_io_done(cmd, cmd->result);
+            set_cmd_async(cmd);
+            return 0;
+        default:
+            break;
+    }
+   
     list_add_tail(&cmd->bs_list, &volume->pending_list);
-    pthread_mutex_unlock(&volume->pending_lock);
-
-    pthread_cond_signal(&volume->pending_cond);
+    _eventfd_write(volume->pending_eventfd);
 
     set_cmd_async(cmd);
-
-    eprintf("cmd submit cmd cdb[0]=%d ok \n", cmd->scb[0]);
     return 0;
 }
 
-static struct backingstore_template hijacker_bst = {
+static struct backingstore_template hijacker_bst = 
+{
     .bs_name = "hijacker",
     .bs_datasize = sizeof(hijacker_volume_t),
 
