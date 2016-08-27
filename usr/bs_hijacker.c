@@ -7,9 +7,9 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <string.h>
+#include <netinet/tcp.h> 
+#include <sys/socket.h> 
+#include <string.h> 
 #include <stdbool.h>
 #include <assert.h>
 
@@ -37,41 +37,41 @@ static hijacker_request_t* bs_request_construct(struct scsi_cmd* cmd) {
     switch (cmd->scb[0]) {
         case SYNCHRONIZE_CACHE:
         case SYNCHRONIZE_CACHE_16:
-            {
-                io_request = (hijacker_request_t*) malloc(sizeof(hijacker_request_t));
-                assert(NULL != io_request);
-                io_request->magic = HIJACKER_MAGIC;
-                io_request->type = SYNC_CACHE;
-                io_request->reserves = 0;
-                io_request->handle = (uint64_t) cmd;
-                io_request->offset = cmd->offset;
-                io_request->len = scsi_get_in_length(cmd);
-                break;
-            }
+        {
+            io_request = (hijacker_request_t*)malloc(sizeof(hijacker_request_t));
+            assert(NULL != io_request);
+            io_request->magic = HIJACKER_MAGIC;
+            io_request->type = SYNC_CACHE;
+            io_request->reserves = 0;
+            io_request->handle = (uint64_t) cmd;
+            io_request->offset = cmd->offset;
+            io_request->len = scsi_get_in_length(cmd);
+            break;
+        }
         case WRITE_6:
         case WRITE_10:
         case WRITE_12:
         case WRITE_16:
-            {
-                int req_len = sizeof(hijacker_request_t) + scsi_get_out_length(cmd);
-                io_request = (hijacker_request_t*) malloc(req_len);
-                assert(NULL != io_request);
-                io_request->magic = HIJACKER_MAGIC;
-                io_request->type = SCSI_WRITE;
-                io_request->reserves = 0;
-                io_request->handle = (uint64_t) cmd;
-                io_request->offset = cmd->offset;
-                io_request->len = scsi_get_out_length(cmd);
-                /*fixme: to be optimized, here should avoid memory copy*/
-                memcpy(io_request->data, scsi_get_out_buffer(cmd),
-                       scsi_get_out_length(cmd));
-                break;
-            }
+        {
+            int req_len = sizeof(hijacker_request_t)+scsi_get_out_length(cmd);
+            io_request = (hijacker_request_t*) malloc(req_len);
+            assert(NULL != io_request);
+            io_request->magic = HIJACKER_MAGIC;
+            io_request->type = SCSI_WRITE;
+            io_request->reserves = 0;
+            io_request->handle = (uint64_t) cmd;
+            io_request->offset = cmd->offset;
+            io_request->len = scsi_get_out_length(cmd);
+            /*fixme: to be optimized, here should avoid memory copy*/
+            memcpy(io_request->data, scsi_get_out_buffer(cmd),
+                    scsi_get_out_length(cmd));
+            break;
+        }
         case READ_6:
         case READ_10:
         case READ_12:
         case READ_16:
-            io_request = (hijacker_request_t*) malloc(sizeof(hijacker_request_t));
+            io_request=(hijacker_request_t*)malloc(sizeof(hijacker_request_t));
             assert(NULL != io_request);
             io_request->magic = HIJACKER_MAGIC;
             io_request->type = SCSI_READ;
@@ -94,7 +94,57 @@ static void bs_request_deconstruct(hijacker_request_t* req) {
     }
 }
 
-static int bs_socket_send(hijacker_volume_t* volume, hijacker_request_t* request) {
+static int bs_socket_init(hijacker_volume_t* volume, char* host, short port)
+{
+    int ret = 0;
+    volume->jwriter_host = strdup(host);
+    volume->jwriter_port = port;
+    volume->jwriter_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if(-1 == volume->jwriter_sock){
+        eprintf("failed to create socket err=%d \n", errno);
+        goto err;
+    }
+
+    struct sockaddr_in jwriter_addr;
+    memset(&jwriter_addr, 0, sizeof(jwriter_addr));
+    jwriter_addr.sin_family = AF_INET;
+    jwriter_addr.sin_port = htons(port);
+    ret = inet_pton(AF_INET, host, &jwriter_addr.sin_addr);
+    if(ret <= 0){
+        eprintf("failed to inet_pton,errno:%d error:%s \n",errno,strerror(ret));
+        goto err;
+    }
+
+    ret = connect(volume->jwriter_sock, &jwriter_addr, sizeof(jwriter_addr));
+    if(ret <= 0){
+        eprintf("failed to connect,host:%s errno:%d error:%s \n", host, 
+                    errno, strerror(ret));
+        goto err;
+    }
+
+    int disable = 1;
+    ret = setsockopt(volume->jwriter_sock, IPPROTO_TCP, TCP_NODELAY, 
+                     &disable, sizeof(disable));
+    if(ret < 0){
+        eprintf("failed to setsockopt,  errno:%d error:%s \n", 
+                    errno, strerror(ret));
+        goto err;
+    }
+    eprintf("socket init ok \n");
+    return ret;
+err:
+    eprintf("socket init failed \n");
+    return ret;
+}
+
+static void bs_socket_fini(hijacker_volume_t* volume)
+{
+    if(volume && -1 == volume->jwriter_sock){
+        close(volume->jwriter_sock);
+    }
+}
+
+static int bs_socket_send(hijacker_volume_t*volume, hijacker_request_t*request){
     ssize_t nwrite = 0;
     char* p_buf = (char*) request;
     ssize_t p_buf_len = sizeof(*request) + request->len;
@@ -117,17 +167,18 @@ static int bs_socket_send(hijacker_volume_t* volume, hijacker_request_t* request
     return p_buf_len;
 }
 
-static int bs_socket_recv(hijacker_volume_t* volume, hijacker_reply_t** reply)
-{
+static int bs_socket_recv(hijacker_volume_t* volume, hijacker_reply_t** reply){
     hijacker_reply_t reply_head = {0};
 
     int ret = read(volume->jwriter_sock, &reply_head, sizeof(reply_head));
     if(ret != sizeof(reply_head)){
-        eprintf("failed socket read reply head ret=%d want=%ld \n", ret, sizeof(reply_head));
+        eprintf("failed socket read reply head ret=%d want=%ld \n", 
+                    ret, sizeof(reply_head));
         return -1;
     }
-
-    hijacker_reply_t* out_reply = (hijacker_reply_t*)malloc(sizeof(hijacker_reply_t) + reply_head.len);
+    
+    size_t out_reply_len = sizeof(hijacker_reply_t) + reply_head.len;
+    hijacker_reply_t* out_reply = (hijacker_reply_t*)malloc(out_reply_len);
     memset(out_reply, 0, sizeof(hijacker_reply_t));
     memcpy(out_reply, &reply_head, sizeof(reply_head));
 
@@ -159,6 +210,55 @@ static int bs_socket_recv(hijacker_volume_t* volume, hijacker_reply_t** reply)
     return 0;
 }
 
+/*todo(optimized): block notify server start/stop volume protected*/
+static int bs_volume_notify(hijacker_volume_t* volume, bool start){
+
+    int req_len = sizeof(hijacker_request_t);
+    req_len += start ? sizeof(add_vol_req_t) : sizeof(del_vol_req_t);
+
+    hijacker_request_t* req = (hijacker_request_t*)malloc(req_len);
+    memset(req, 0, req_len);
+    req->magic = HIJACKER_MAGIC;
+    req->type  = start ? ADD_VOLUME : DEL_VOLUME;
+    req->reserves = 0;
+    req->handle = 0;
+    req->offset = 0;
+    req->len = sizeof(add_vol_req_t);
+   
+    if(start){
+        add_vol_req_t* add_vol = (add_vol_req_t*)req->data;
+        strcpy(add_vol->volume_name, volume->volume_name);
+        strcpy(add_vol->device_path, volume->device_path);
+    } else {
+        del_vol_req_t* add_vol = (del_vol_req_t*)req->data;
+        strcpy(add_vol->volume_name, volume->volume_name);
+    }
+
+    int ret = bs_socket_send(volume, req);
+    if(ret != req_len){
+        eprintf("notify start send err ret:%d size:%d \n", ret, req_len);
+        goto out;;
+    }
+
+    hijacker_reply_t* reply = NULL;
+    ret = bs_socket_recv(volume, &reply);
+    if(ret || NULL == reply){
+        eprintf("notify start recv err ret:%d \n", ret);
+        goto out;
+    }
+   
+    eprintf("notify %s ok\n", (start ? "start" : "stop"));
+out:
+    if(reply){
+        free(reply);
+    }
+    if(req){
+        free(req);
+    }
+    return ret;;
+}
+
+
 static void* bs_net_send_thr(void* arg)
 {
     hijacker_volume_t* volume = (hijacker_volume_t*)arg;
@@ -185,8 +285,9 @@ static void* bs_net_send_thr(void* arg)
         {
             hijacker_request_t* request = bs_request_construct(cur_cmd);
             if(request){
-                eprintf("send thr request magic:%d type:%d handle:%ld len:%d \n",
-                        request->magic, request->type, request->handle, request->len);
+                eprintf("send thr request magic:%d type:%d handle:%ld len:%d n",
+                        request->magic, request->type, 
+                        request->handle, request->len);
 
                 send_req_size += bs_socket_send(volume, request);
                 send_req_num++; 
@@ -197,7 +298,8 @@ static void* bs_net_send_thr(void* arg)
             }
         }
 
-        tracepoint(hijacker_provider, net_send_tracepoint, send_req_num, send_req_size);
+        tracepoint(hijacker_provider,net_send_tracepoint,
+                    send_req_num, send_req_size);
     }
 
     pthread_exit(NULL);
@@ -271,7 +373,8 @@ static void* bs_scsi_ack_thr(void* arg)
 
         list_for_each_entry_safe(cur_cmd, next_cmd, &acking_que, bs_list){
             list_del(&cur_cmd->bs_list);
-            eprintf("scsi cdb[0]=%d result=%d \n", cur_cmd->scb[0], cur_cmd->result);
+            eprintf("scsi cdb[0]=%d result=%d \n", 
+                        cur_cmd->scb[0], cur_cmd->result);
             target_cmd_io_done(cur_cmd, cur_cmd->result);
         }
     }
@@ -290,9 +393,14 @@ static void* bs_heart_beat_thr(void* arg)
     pthread_exit(NULL);
 }
 
-
 static void bs_volume_deinit(hijacker_volume_t* volume)
 {
+    int ret = bs_volume_notify(volume , false);
+    eprintf("stopped notify stop ret:%d \n", ret);
+
+    bs_socket_fini(volume);
+    eprintf("stopped socket \n");
+
     pthread_cancel(volume->heart_beat_thr);
     pthread_join(volume->heart_beat_thr, NULL);
     eprintf("stopped the heart beat thread \n");
@@ -309,9 +417,6 @@ static void bs_volume_deinit(hijacker_volume_t* volume)
     pthread_join(volume->send_thr, NULL);
     eprintf("stopped the send thread \n");
 
-    if(-1 == volume->jwriter_sock){
-        close(volume->jwriter_sock);
-    }
     pthread_cond_destroy(&volume->scsi_ack_cond);
     pthread_mutex_destroy(&volume->scsi_ack_lock);
 
@@ -319,10 +424,26 @@ static void bs_volume_deinit(hijacker_volume_t* volume)
     pthread_mutex_destroy(&volume->pending_lock);
 }
 
-static int bs_volume_init(hijacker_volume_t* volume, char* host, short port)
-{
+static int bs_volume_init(hijacker_volume_t* volume, 
+                          char* volume_name, char* device_path,
+                          char* host, short port){
     int ret;
     INIT_LIST_HEAD(&volume->volume_list);
+
+    strcpy(volume->volume_name, volume_name);
+    strcpy(volume->device_path, device_path);
+
+    ret = bs_socket_init(volume, host, port);
+    if(ret){
+        eprintf("failed to socket init., %s \n", strerror(ret));
+        goto err;
+    }
+    
+    ret = bs_volume_notify(volume, true);
+    if(ret){
+        eprintf("failed to notify start., %s \n", strerror(ret));
+        goto err;
+    }
 
     pthread_cond_init(&volume->pending_cond, NULL);
     pthread_mutex_init(&volume->pending_lock, NULL);
@@ -331,57 +452,32 @@ static int bs_volume_init(hijacker_volume_t* volume, char* host, short port)
     pthread_cond_init(&volume->scsi_ack_cond, NULL);
     pthread_mutex_init(&volume->scsi_ack_lock, NULL);
     INIT_LIST_HEAD(&volume->scsi_ack_list);
-
-    volume->jwriter_host = strdup(host);
-    volume->jwriter_port = port;
-    volume->jwriter_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if(-1 == volume->jwriter_sock){
-        eprintf("failed to create socket err=%d \n", errno);
-        goto err;
-    }
-
-    struct sockaddr_in jwriter_addr;
-    memset(&jwriter_addr, 0, sizeof(jwriter_addr));
-    jwriter_addr.sin_family = AF_INET;
-    jwriter_addr.sin_port = htons(port);
-    ret = inet_pton(AF_INET, host, &jwriter_addr.sin_addr);
-    if(ret <= 0){
-        eprintf("failed to inet_pton, errno:%d error:%s \n", errno, strerror(ret));
-        goto err;
-    }
-    ret = connect(volume->jwriter_sock, &jwriter_addr, sizeof(jwriter_addr));
-    if(ret <= 0){
-        eprintf("failed to connect, host:%s errno:%d error:%s \n", host, errno, strerror(ret));
-        goto err;
-    }
-
-    int disable = 1;
-    ret = setsockopt(volume->jwriter_sock, IPPROTO_TCP, TCP_NODELAY, &disable, sizeof(disable));
-    if(ret < 0){
-        eprintf("failed to setsockopt,  errno:%d error:%s \n", errno, strerror(ret));
-        goto err;
-    }
-
+    
     ret = pthread_create(&volume->send_thr, NULL, bs_net_send_thr, volume);
     if(ret){
         eprintf("failed to create send thread., %s \n", strerror(ret));
         goto err;
     }
+
     ret = pthread_create(&volume->recv_thr, NULL, bs_net_recv_thr, volume);
     if(ret){
         eprintf("failed to create recv thread., %s \n", strerror(ret));
         goto err;
     }
+
     ret = pthread_create(&volume->scsi_ack_thr, NULL, bs_scsi_ack_thr, volume);
     if(ret){
         eprintf("failed to create scsi ack thread., %s \n", strerror(ret));
         goto err;
     }
-    ret = pthread_create(&volume->heart_beat_thr, NULL, bs_heart_beat_thr, volume);
+
+    ret = pthread_create(&volume->heart_beat_thr, NULL, bs_heart_beat_thr, 
+                         volume);
     if(ret){
         eprintf("failed to create heart beat thread., %s \n", strerror(ret));
         goto err;
     }
+
     eprintf("volume init ok \n");
     return 0;
 err:
@@ -389,6 +485,7 @@ err:
     eprintf("volume init failed \n");
     return -1;
 }
+
 
 static char* util_slurp_to_semi(char **p)
 {
@@ -441,6 +538,8 @@ static tgtadm_err bs_hijacker_init(struct scsi_lu* lu, char* bsopts)
 
     char* host = "127.0.0.1";
     short port = 1111;
+    char* volume_name = "test_vol";
+    char* device_path = "/dev/sdx";
 
     while(bsopts && strlen(bsopts)){
         if(util_is_opt("host", bsopts)){
@@ -460,7 +559,7 @@ static tgtadm_err bs_hijacker_init(struct scsi_lu* lu, char* bsopts)
         return TGTADM_UNKNOWN_ERR;
     }
 
-    int ret = bs_volume_init(volume, host, port);
+    int ret = bs_volume_init(volume,volume_name,device_path, host, port); 
     if(ret < 0){
         eprintf("failed to bs_volume_init \n");
         return TGTADM_UNKNOWN_ERR;
@@ -479,14 +578,16 @@ static void bs_hijacker_exit(struct scsi_lu* lu)
     bs_volume_deinit(volume);
 }
 
-static int bs_hijacker_open(struct scsi_lu* lu, char* path, int* fd, uint64_t* size)
-{
+static int bs_hijacker_open(struct scsi_lu* lu, char* path, 
+                            int* fd, uint64_t* size){
     uint32_t blksize = 0;
     eprintf("open path=%s \n", path);
 
-    *fd = backed_file_open(path, O_RDWR | O_LARGEFILE | lu->bsoflags, size, &blksize);
+    *fd = backed_file_open(path, O_RDWR | O_LARGEFILE | lu->bsoflags, 
+                           size, &blksize);
     if(*fd == -1 && (errno == EACCES || errno == EROFS)){
-        *fd = backed_file_open(path, O_RDONLY | O_LARGEFILE | lu->bsoflags, size, &blksize);
+        *fd = backed_file_open(path, O_RDONLY | O_LARGEFILE | lu->bsoflags, 
+                               size, &blksize);
         lu->attrs.readonly = 1;
     }
 
