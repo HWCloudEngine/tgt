@@ -9,6 +9,9 @@
 
 #include "list.h"
 
+#define MAX_VOLUME_NAME (128)
+#define MAX_DEVICE_PATH (256)
+
 typedef struct hijacker_volume_magr {
     pthread_mutex_t    mgr_lock;
     struct list_head   volumes_list;
@@ -23,6 +26,16 @@ enum socket_status {
 
 typedef struct hijacker_volume {
     struct list_head volume_list;
+    
+    /*volume info */
+    char volume_name[MAX_VOLUME_NAME];
+    char device_path[MAX_DEVICE_PATH];
+
+    /*socket with journal writer*/
+    char*               jwriter_host;
+    short               jwriter_port;
+    int                 jwriter_sock;
+    enum socket_status  jwriter_sock_status;
 
     /*scsi cmd queue*/
     pthread_cond_t      pending_cond;
@@ -33,12 +46,6 @@ typedef struct hijacker_volume {
     pthread_cond_t      scsi_ack_cond;
     pthread_mutex_t     scsi_ack_lock;
     struct list_head    scsi_ack_list;
-
-    /*socket with journal writer*/
-    char*               jwriter_host;
-    short               jwriter_port;
-    int                 jwriter_sock;
-    enum socket_status  jwriter_sock_status;
 
     /*network send and recv thread*/
     pthread_t send_thr;
@@ -83,5 +90,16 @@ enum hijacker_request_code {
     SYNC_CACHE = 5    /*synchronize cache when iscsi initiator logout*/ 
 };
 typedef enum hijacker_request_code hijacker_request_code_t;
+
+struct add_vol_req{
+    char volume_name[MAX_VOLUME_NAME];
+    char device_path[MAX_DEVICE_PATH];
+};
+typedef struct add_vol_req add_vol_req_t;
+
+struct del_vol_req{
+    char volume_name[MAX_VOLUME_NAME];
+};
+typedef struct del_vol_req del_vol_req_t;
 
 #endif
