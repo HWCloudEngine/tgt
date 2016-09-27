@@ -116,19 +116,18 @@ static int bs_socket_init(hijacker_volume_t* volume, char* host, short port)
     }
 #endif
 
-  
+   // ret = bs_socket_set_nonblock(volume->jwriter_sock);
+   // if(ret < 0){
+   //     eprintf("failed to socket set nonblock, errno:%d \n", errno);
+   //     goto err;
+   // }
+   
 #ifndef _USE_UNIX_DOMAIN
     ret = bs_socket_set_nodelay(volume->jwriter_sock);
     if(ret < 0){
         eprintf("failed to socket set nodelay, errno:%d \n", errno);
         goto err;
     }
-
-    //ret = bs_socket_set_nonblock(volume->jwriter_sock);
-    //if(ret < 0){
-    //    eprintf("failed to socket set nonblock, errno:%d \n", errno);
-    //    goto err;
-    //}
     //const int buf_size = 8*1024*1024U;
     //ret = bs_socket_set_sndbuf(volume->jwriter_sock, buf_size);
     //if(ret < 0){
@@ -538,18 +537,21 @@ static int bs_volume_notify(hijacker_volume_t* volume, bool start)
         goto out;;
     }
 
-    hijacker_reply_t reply = {};
+    hijacker_reply_t reply = {0};
     ret = bs_socket_recv(volume, (char*)&reply, sizeof(reply));
     if(ret != sizeof(reply)){
-        eprintf("notify start recv err ret:%d \n", ret);
+        eprintf("notify start recv err ret:%d size:%ld \n", ret, sizeof(reply));
         goto out;
     }
     
     if(reply.error == 0){
         eprintf("notify %s ok\n", (start ? "start" : "stop"));
+        ret = 0;
     } else {
         eprintf("notify %s failed\n", (start ? "start" : "stop"));
+        ret = -1;
     }
+
 out:
     if(req){
         free(req);
@@ -574,7 +576,12 @@ static int bs_volume_init(hijacker_volume_t* volume,
         eprintf("failed to socket init., %s \n", strerror(ret));
         goto err;
     }
-    
+    ret = bs_volume_notify(volume, true);
+    if(ret){
+        eprintf("failed to volume notify start \n");
+        goto err;
+    }
+
     INIT_LIST_HEAD(&volume->pending_list);
     volume->pending_eventfd = eventfd(0, EFD_NONBLOCK);
     ret = tgt_event_add(volume->pending_eventfd, 
@@ -595,7 +602,12 @@ err:
 }
 
 static void bs_volume_deinit(hijacker_volume_t* volume)
-{
+{    
+    eprintf("volume deinit \n");
+    int ret = bs_volume_notify(volume,false);
+    if(ret){
+        eprintf("failed to volume notify stop \n");
+    }
     bs_socket_fini(volume);
     volume->request_id = 0;
     eprintf("volume deinit ok \n");
@@ -633,10 +645,12 @@ static tgtadm_err bs_hijacker_init(struct scsi_lu* lu, char* bsopts)
         return TGTADM_NOMEM;
     }
 
-    char* host = "127.0.0.1";
-    short port = 9999;
-    char* volume_name = "test_vol";
-    char* device_path = "/dev/sdx";
+    char* host = NULL;
+    short port = 0;
+    char* volume_name = NULL;
+    char* device_path = NULL;
+
+    eprintf("hijacker init bsopts:%s ok \n",bsopts);
 
     while(bsopts && strlen(bsopts)){
         if(util_is_opt("host", bsopts)){
@@ -644,6 +658,10 @@ static tgtadm_err bs_hijacker_init(struct scsi_lu* lu, char* bsopts)
         } else if (util_is_opt("port", bsopts)){
             char* port_str = util_slurp_value(&bsopts);
             port = atoi(port_str);
+        }  else if (util_is_opt("volume", bsopts)){
+            volume_name = util_slurp_value(&bsopts);
+        }  else if (util_is_opt("device", bsopts)){
+            device_path = util_slurp_value(&bsopts);
         } else {
             char* ignore = util_slurp_to_semi(&bsopts);
             eprintf("ignoring unkown option %s \n", ignore);
@@ -651,6 +669,7 @@ static tgtadm_err bs_hijacker_init(struct scsi_lu* lu, char* bsopts)
             break;
         }
     }
+
     if(!host){
         eprintf("Crit: you should config log server host ip \n");
         return TGTADM_UNKNOWN_ERR;
@@ -662,7 +681,8 @@ static tgtadm_err bs_hijacker_init(struct scsi_lu* lu, char* bsopts)
         return TGTADM_UNKNOWN_ERR;
     }
 
-    eprintf("hijacker init ok \n");
+    eprintf("hijacker init host:%s port:%d volume_name:%s device_path:%s ok \n", 
+            host, port, volume_name, device_path);
     return TGTADM_SUCCESS;
 }
 
