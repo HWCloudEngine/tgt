@@ -108,10 +108,10 @@ static int bs_socket_init(hijacker_volume_t* volume, char* host, short port)
     struct sockaddr_un addr;
     memset(&addr,0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, UNIX_SOCKET_NAME, sizeof(UNIX_SOCKET_NAME)-1);
+    strncpy(addr.sun_path, host, strlen(host));
     ret = connect(volume->jwriter_sock, &addr, sizeof(addr));
     if(ret < 0){
-        eprintf("connect unix domain name:%s \n", UNIX_SOCKET_NAME);
+        eprintf("connect unix domain name:%s \n", host);
         goto err;
     }
 #endif
@@ -729,23 +729,24 @@ static int bs_hijacker_cmd_submit(struct scsi_cmd* cmd)
     hijacker_volume_t* volume = bs_volume(lu);
 
     switch (cmd->scb[0]) {
-        case SYNCHRONIZE_CACHE:
-        case SYNCHRONIZE_CACHE_16:
-        //case WRITE_6:
-        //case WRITE_10:
-        //case WRITE_12:
-        //case WRITE_16:
-        //case READ_6:
-        //case READ_10:
-        //case READ_12:
-        //case READ_16:
+        //case SYNCHRONIZE_CACHE:
+        //case SYNCHRONIZE_CACHE_16:
+        case WRITE_6:
+        case WRITE_10:
+        case WRITE_12:
+        case WRITE_16:
+        case READ_6:
+        case READ_10:
+        case READ_12:
+        case READ_16:
+            break;
+        default:
             cmd->result = 0;
             target_cmd_io_done(cmd, cmd->result);
             set_cmd_async(cmd);
             return 0;
-        default:
-            break;
     }
+
     list_add_tail(&cmd->bs_list, &volume->pending_list);
     _eventfd_write(volume->pending_eventfd);
 
