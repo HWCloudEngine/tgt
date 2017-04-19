@@ -718,6 +718,8 @@ static int bs_hijacker_open(struct scsi_lu* lu, char* path,
 
 static void bs_hijacker_close(struct scsi_lu* lu)
 {
+    if(lu && (-1 != lu->fd))
+        close(lu->fd);
     eprintf("close ok \n");
     return ;
 }
