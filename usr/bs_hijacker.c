@@ -16,8 +16,6 @@
 #include "scsi.h"
 #include "util.h"
 
-#include "tracer/tp.h"
-
 #define HIJACKER_MAGIC (0xAA)
 
 hijacker_volume_mgr_t g_volume_mgr;
