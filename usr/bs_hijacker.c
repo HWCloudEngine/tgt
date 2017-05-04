@@ -729,8 +729,8 @@ static int bs_hijacker_cmd_submit(struct scsi_cmd* cmd)
     hijacker_volume_t* volume = bs_volume(lu);
 
     switch (cmd->scb[0]) {
-        //case SYNCHRONIZE_CACHE:
-        //case SYNCHRONIZE_CACHE_16:
+        case SYNCHRONIZE_CACHE:
+        case SYNCHRONIZE_CACHE_16:
         case WRITE_6:
         case WRITE_10:
         case WRITE_12:
