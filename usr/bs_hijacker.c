@@ -250,9 +250,9 @@ static hijacker_request_t* bs_request_create(hijacker_volume_t* volume,
     hijacker_request_t* io_req = (hijacker_request_t*)malloc(io_req_len);
     assert(NULL != io_req);
     memset(io_req, 0, io_req_len);
-    io_req->magic    = HIJACKER_MAGIC;
-    io_req->reserves = volume->request_id++;
-    io_req->handle   = (uint64_t)cmd;
+    io_req->magic = HIJACKER_MAGIC;
+    io_req->seq = volume->request_id++;
+    io_req->handle = (uint64_t)cmd;
     switch (cmd->scb[0]) {
         case SYNCHRONIZE_CACHE:
         case SYNCHRONIZE_CACHE_16:
@@ -288,7 +288,6 @@ static void bs_request_destroy(hijacker_request_t* req)
         free(req);
     }
 }
-
 
 /*callback*/
 void socket_write_callback(int fd, int events, void* data);
@@ -331,7 +330,7 @@ void socket_write_callback(int fd, int events, void* data)
         if(request){
 #if 0
             eprintf("send thr request magic:%d id:%d type:%d handle:%ld off=%ld len:%d\n",
-                    request->magic, request->reserves, request->type, 
+                    request->magic, request->seq, request->type, 
                     request->handle, request->offset, request->len);
 #endif
             /*send request head*/
@@ -391,7 +390,7 @@ void socket_read_callback(int fd, int events, void* data)
 
 #if 0
         eprintf("recv thr reply magic:%d id:%d err:%d handle:%ld len:%d \n",
-                reply->magic, reply->reserves, reply->error, 
+                reply->magic, reply->seq, reply->error, 
                 reply->handle, reply->len);
 #endif
 
@@ -514,8 +513,8 @@ static int bs_volume_notify(hijacker_volume_t* volume, bool start)
     hijacker_request_t* req = (hijacker_request_t*)malloc(req_len);
     memset(req, 0, req_len);
     req->magic = HIJACKER_MAGIC;
-    req->type  = start ? ADD_VOLUME : DEL_VOLUME;
-    req->reserves = 0;
+    req->type = start ? ADD_VOLUME : DEL_VOLUME;
+    req->seq = volume->request_id++;
     req->handle = 0;
     req->offset = 0;
     req->len = start ? sizeof(add_vol_req_t) : sizeof(del_vol_req_t);
@@ -568,7 +567,8 @@ static int bs_volume_init(hijacker_volume_t* volume,
 
     strcpy(volume->volume_name, volume_name);
     strcpy(volume->device_path, device_path);
-    
+    volume->request_id  = 0;
+
     ret = bs_socket_init(volume, host, port);
     if(ret){
         eprintf("failed to socket init., %s \n", strerror(ret));
@@ -589,7 +589,6 @@ static int bs_volume_init(hijacker_volume_t* volume,
         eprintf("failed to add pending read event, errno:%d \n", errno);
         goto err;
     }
-    volume->request_id  = 0;
     INIT_LIST_HEAD(&volume->sending_list);
     eprintf("volume init ok \n");
     return 0;
